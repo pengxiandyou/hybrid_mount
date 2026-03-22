@@ -1,4 +1,4 @@
-name: Build Android ARM64
+name: Build Hybrid Mount for Android
 
 on:
   push:
@@ -8,98 +8,112 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     
     env:
       ANDROID_API_LEVEL: 29
       TARGET_ARCH: aarch64-linux-android
+      NDK_VERSION: r29
     
     steps:
-    - uses: actions/checkout@v6
+    - name: Checkout code
+      uses: actions/checkout@v6
       with:
         submodules: recursive
-        
+    
     - name: Setup NDK
       uses: nttld/setup-ndk@v1
       with:
-        ndk-version: r29
+        ndk-version: ${{ env.NDK_VERSION }}
         add-to-path: true
         link-to-sdk: true
-        
-    - name: Setup Rust
+    
+    - name: Setup Rust toolchain
       uses: dtolnay/rust-toolchain@nightly
       with:
-        targets: aarch64-linux-android
+        targets: ${{ env.TARGET_ARCH }}
         components: rust-src, clippy, rustfmt
-        
-    - name: Setup Rust Cache
+    
+    - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
-      
-    - name: Install Dependencies
+      with:
+        prefix-key: v0-rust
+        add-job-id-key: true
+    
+    - name: Install dependencies
       run: |
         sudo apt update && sudo apt install -y \
           gcc-multilib g++-multilib \
           pkg-config libssl-dev \
           android-sdk-build-tools
         cargo install cargo-ndk --locked
-        mkdir -p output target/aarch64-linux-android/release
+        mkdir -p output target/${{ env.TARGET_ARCH }}/release
         chmod -R 777 .
-        
-    - name: Build for Android
+    
+    - name: Build Hybrid Mount
       run: |
-        # 上面修改后的构建脚本内容
-        NDK_VERSION=$(grep -oP 'r\d+' $ANDROID_NDK_HOME/source.properties | cut -c2-)
-        CLANG_BIN="aarch64-linux-android${ANDROID_API_LEVEL}-clang"
-        EXTRA_LINK_ARG="--target=aarch64-linux-android${ANDROID_API_LEVEL}"
-        NDK_SYSROOT="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
-        NDK_LIB_PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/$ANDROID_API_LEVEL"
+        # 获取 NDK 路径和版本
+        NDK_HOME=${ANDROID_NDK_HOME}
+        NDK_SYSROOT="${NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+        NDK_LIB_PATH="${NDK_SYSROOT}/usr/lib/${{ env.TARGET_ARCH }}/${{ env.ANDROID_API_LEVEL }}"
         
+        # 验证库文件（同时检查静态库和动态库）
+        echo "=== Checking liblog files ==="
+        ls -la ${NDK_LIB_PATH}/ | grep log
+        ls -la ${NDK_SYSROOT}/usr/lib/${{ env.TARGET_ARCH }}/ | grep log
+        
+        # 配置 Cargo（关键修复：移除冲突参数）
         mkdir -p .cargo
         cat > .cargo/config.toml << EOF
-        [target.${TARGET_ARCH}]
-        linker = "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/$CLANG_BIN"
-        ar = "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+        [target.${{ env.TARGET_ARCH }}]
+        linker = "${NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${{ env.ANDROID_API_LEVEL }}-clang"
+        ar = "${NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
         rustflags = [
-            "-C", "link-arg=-fuse-ld=lld",
-            "-C", "target-feature=+crt-static",
+            # 基础优化
             "-C", "opt-level=3",
-            "-C", "link-arg=$EXTRA_LINK_ARG",
-            "-C", "link-arg=-L$NDK_LIB_PATH",
+            "-C", "lto=thin",
+            # 正确的链接器配置
+            "-C", "link-arg=-fuse-ld=lld",
+            "-C", "link-arg=--target=aarch64-linux-android${{ env.ANDROID_API_LEVEL }}",
+            # 显式指定库路径（使用绝对路径）
+            "-C", "link-arg=-L${NDK_LIB_PATH}",
+            "-C", "link-arg=-L${NDK_SYSROOT}/usr/lib/${{ env.TARGET_ARCH }}",
+            # 链接必要的系统库（静态优先）
+            "-C", "link-arg=-Wl,-Bstatic",
             "-C", "link-arg=-llog",
+            "-C", "link-arg=-Wl,-Bdynamic",
+            # 基础系统库
             "-C", "link-arg=-lc",
             "-C", "link-arg=-lm",
             "-C", "link-arg=-ldl",
-            "-C", "link-arg=-pie",
+            # 移除冲突的 PIE 参数
             "-C", "link-arg=-fPIE",
+            # NDK 必要的链接参数
+            "-C", "link-arg=-zrelro",
+            "-C", "link-arg=-znow",
         ]
         [build]
-        target = "${TARGET_ARCH}"
+        target = "${{ env.TARGET_ARCH }}"
         EOF
         
-        # 验证文件
-        CLANG_PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/$CLANG_BIN"
-        if [ -f "$CLANG_PATH" ]; then
-            echo "✅ NDK clang工具存在: $CLANG_PATH"
-        else
-            echo "❌ 未找到NDK clang工具"
-            ls -la $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/ | grep aarch64
-            exit 1
-        fi
+        # 显示配置文件内容（调试用）
+        cat .cargo/config.toml
         
-        LOG_LIB_PATH="$NDK_LIB_PATH/liblog.so"
-        if [ -f "$LOG_LIB_PATH" ]; then
-            echo "✅ liblog库存在: $LOG_LIB_PATH"
-        else
-            echo "❌ 未找到liblog库"
-            ls -la $NDK_LIB_PATH/ | grep log
-            exit 1
-        fi
+        # 直接使用 cargo build 而非 cargo-ndk（避免参数覆盖）
+        export CC_aarch64_linux_android="${NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${{ env.ANDROID_API_LEVEL }}-clang"
+        export CXX_aarch64_linux_android="${NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${{ env.ANDROID_API_LEVEL }}-clang++"
+        export AR_aarch64_linux_android="${NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+        export LD_aarch64_linux_android="${NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/ld.lld"
         
         # 构建
-        cargo ndk -t arm64-v8a -o output build --release
+        cargo build --target ${{ env.TARGET_ARCH }} --release --verbose
         
-    - name: Upload Artifact
+        # 复制输出文件
+        mkdir -p output/arm64-v8a
+        cp target/${{ env.TARGET_ARCH }}/release/hybrid-mount output/arm64-v8a/
+        
+    - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: hybrid-mount-android-arm64
-        path: output/arm64-v8a/
+        name: hybrid-mount-android-arm64-v8a
+        path: output/
