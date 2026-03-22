@@ -5,44 +5,66 @@ on:
     branches: [ master ]
   pull_request:
     branches: [ master ]
-  workflow_dispatch: # 允许手动触发
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
+      - name: Checkout code (with submodules)
         uses: actions/checkout@v6
         with:
-          submodules: recursive
+          submodules: recursive  # 强制拉取所有子模块
           fetch-depth: 0
+          lfs: true
 
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r29
+          add-to-path: true  # 将NDK加入环境变量
 
       - name: Setup Rust nightly
         uses: dtolnay/rust-toolchain@nightly
         with:
-          targets: aarch64-linux-android
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
           components: rust-src, clippy
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            ./xtask
+            ./hybrid-mount
 
       - name: Install build dependencies
         run: |
-          sudo apt update
-          sudo apt install -y gcc-multilib
+          sudo apt update && sudo apt install -y gcc-multilib pkg-config
           cargo install cargo-ndk --locked
+          # 提前创建output目录（避免xtask找不到目录）
+          mkdir -p output
 
-      - name: Build Hybrid Mount
+      - name: Fix NDK environment variables
         run: |
-          cargo xtask build --ci
+          echo "NDK_PATH=${ANDROID_NDK_ROOT}" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=${ANDROID_NDK_ROOT}" >> $GITHUB_ENV
+
+      - name: Build Hybrid Mount (去掉--ci参数)
+        run: |
+          # 先编译xtask并验证路径
+          cargo build --manifest-path xtask/Cargo.toml
+          # 执行xtask build（去掉--ci，避免参数无效）
+          cargo xtask build
+        env:
+          RUST_LOG: debug
+          ANDROID_NDK_ROOT: ${{ env.ANDROID_NDK_ROOT }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
+        if: success()  # 仅构建成功时上传
         with:
           name: hybrid-mount-build
-          path: output/*.zip
+          path: |
+            output/*.zip
+            target/**/*.so
+            target/**/*.bin
