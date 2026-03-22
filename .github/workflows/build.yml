@@ -10,61 +10,98 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      # 强制指定NDK路径（匹配GitHub Actions安装路径）
+      ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/29.0.0
+      # Rust交叉编译目标（仅保留主流架构）
+      TARGETS: aarch64-linux-android
+
     steps:
-      - name: Checkout code (with submodules)
+      - name: Checkout code (修复子模块拉取)
         uses: actions/checkout@v6
         with:
-          submodules: recursive  # 强制拉取所有子模块
+          submodules: recursive
           fetch-depth: 0
-          lfs: true
+          # 确保拉取完整仓库，无路径缺失
+          path: hybrid_mount
 
-      - name: Setup Android NDK
+      - name: 进入项目根目录
+        run: cd $GITHUB_WORKSPACE/hybrid_mount && pwd && ls -la
+
+      - name: Setup Android NDK r29 (修复路径)
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r29
-          add-to-path: true  # 将NDK加入环境变量
+          add-to-path: true
+          # 强制安装到标准路径
+          install-dir: /usr/local/lib/android/sdk/ndk
 
-      - name: Setup Rust nightly
+      - name: Setup Rust nightly (适配Android)
         uses: dtolnay/rust-toolchain@nightly
         with:
-          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
-          components: rust-src, clippy
+          targets: ${{ env.TARGETS }}
+          components: rust-src, clippy, rustfmt
 
-      - name: Cache Rust dependencies
+      - name: 修复Rust Cache路径（核心！）
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: |
-            ./xtask
-            ./hybrid-mount
+          # 指向真实的项目根目录，而非不存在的hybrid-mount子目录
+          workspaces: ${{ github.workspace }}/hybrid_mount -> target
+          # 禁用不必要的检查，避免路径报错
+          shared-key: ${{ runner.os }}-rust-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install build dependencies
+      - name: 安装交叉编译依赖
         run: |
-          sudo apt update && sudo apt install -y gcc-multilib pkg-config
+          sudo apt update && sudo apt install -y \
+            gcc-multilib g++-multilib \
+            pkg-config libssl-dev \
+            android-sdk-build-tools
+          # 安装cargo-ndk并配置
           cargo install cargo-ndk --locked
-          # 提前创建output目录（避免xtask找不到目录）
-          mkdir -p output
+          # 提前创建xtask需要的所有目录
+          mkdir -p $GITHUB_WORKSPACE/hybrid_mount/output
+          mkdir -p $GITHUB_WORKSPACE/hybrid_mount/target/$TARGETS/debug
+          # 赋予目录读写权限
+          chmod -R 777 $GITHUB_WORKSPACE/hybrid_mount
 
-      - name: Fix NDK environment variables
+      - name: 手动配置NDK交叉编译环境
         run: |
-          echo "NDK_PATH=${ANDROID_NDK_ROOT}" >> $GITHUB_ENV
-          echo "ANDROID_NDK_HOME=${ANDROID_NDK_ROOT}" >> $GITHUB_ENV
+          cd $GITHUB_WORKSPACE/hybrid_mount
+          # 生成Rust交叉编译配置
+          cat > .cargo/config.toml << EOF
+          [target.aarch64-linux-android]
+          linker = "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang"
+          ar = "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+          rustflags = [
+              "-C", "link-arg=-fuse-ld=lld",
+              "-C", "target-feature=+crt-static"
+          ]
+          EOF
+          # 验证NDK工具是否存在
+          ls -la $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang
 
-      - name: Build Hybrid Mount (去掉--ci参数)
+      - name: 编译并执行xtask（核心修复）
         run: |
-          # 先编译xtask并验证路径
-          cargo build --manifest-path xtask/Cargo.toml
-          # 执行xtask build（去掉--ci，避免参数无效）
-          cargo xtask build
+          cd $GITHUB_WORKSPACE/hybrid_mount
+          # 先单独编译xtask，确保二进制可执行
+          cargo build --manifest-path xtask/Cargo.toml --target $TARGETS
+          # 复制xtask二进制到根目录（避免路径查找失败）
+          cp target/$TARGETS/debug/xtask ./xtask-bin
+          # 执行xtask build（指定NDK路径）
+          ./xtask-bin build \
+            --ndk $ANDROID_NDK_HOME \
+            --target $TARGETS \
+            --release
         env:
-          RUST_LOG: debug
-          ANDROID_NDK_ROOT: ${{ env.ANDROID_NDK_ROOT }}
+          # 强制暴露所有环境变量给xtask
+          PATH: $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
+          RUST_BACKTRACE: full  # 输出详细错误栈，便于排查
 
-      - name: Upload artifact
+      - name: 上传构建产物
         uses: actions/upload-artifact@v4
-        if: success()  # 仅构建成功时上传
+        if: success()
         with:
           name: hybrid-mount-build
           path: |
-            output/*.zip
-            target/**/*.so
-            target/**/*.bin
+            ${{ github.workspace }}/hybrid_mount/output/*.zip
+            ${{ github.workspace }}/hybrid_mount/target/**/*.so
