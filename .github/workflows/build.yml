@@ -1,4 +1,4 @@
-name: Build Android Rust Library
+name: Build Android ARM64
 
 on:
   push:
@@ -18,25 +18,24 @@ jobs:
     - uses: actions/checkout@v6
       with:
         submodules: recursive
-        fetch-depth: 0
-    
+        
     - name: Setup NDK
       uses: nttld/setup-ndk@v1
       with:
         ndk-version: r29
         add-to-path: true
         link-to-sdk: true
-    
-    - name: Setup Rust toolchain
+        
+    - name: Setup Rust
       uses: dtolnay/rust-toolchain@nightly
       with:
         targets: aarch64-linux-android
         components: rust-src, clippy, rustfmt
-    
-    - name: Cache Rust dependencies
+        
+    - name: Setup Rust Cache
       uses: Swatinem/rust-cache@v2
-    
-    - name: Install build dependencies
+      
+    - name: Install Dependencies
       run: |
         sudo apt update && sudo apt install -y \
           gcc-multilib g++-multilib \
@@ -45,15 +44,16 @@ jobs:
         cargo install cargo-ndk --locked
         mkdir -p output target/aarch64-linux-android/release
         chmod -R 777 .
-    
-    - name: Configure NDK and build
+        
+    - name: Build for Android
       run: |
-        # 检测NDK版本，适配clang命名规则
+        # 上面修改后的构建脚本内容
         NDK_VERSION=$(grep -oP 'r\d+' $ANDROID_NDK_HOME/source.properties | cut -c2-)
         CLANG_BIN="aarch64-linux-android${ANDROID_API_LEVEL}-clang"
         EXTRA_LINK_ARG="--target=aarch64-linux-android${ANDROID_API_LEVEL}"
-
-        # 生成.cargo/config.toml（核心配置）
+        NDK_SYSROOT="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+        NDK_LIB_PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/$ANDROID_API_LEVEL"
+        
         mkdir -p .cargo
         cat > .cargo/config.toml << EOF
         [target.${TARGET_ARCH}]
@@ -63,22 +63,43 @@ jobs:
             "-C", "link-arg=-fuse-ld=lld",
             "-C", "target-feature=+crt-static",
             "-C", "opt-level=3",
-            "-C", "link-arg=$EXTRA_LINK_ARG"
+            "-C", "link-arg=$EXTRA_LINK_ARG",
+            "-C", "link-arg=-L$NDK_LIB_PATH",
+            "-C", "link-arg=-llog",
+            "-C", "link-arg=-lc",
+            "-C", "link-arg=-lm",
+            "-C", "link-arg=-ldl",
+            "-C", "link-arg=-pie",
+            "-C", "link-arg=-fPIE",
         ]
-
         [build]
         target = "${TARGET_ARCH}"
         EOF
-
-        # 验证clang工具是否存在（关键校验）
+        
+        # 验证文件
         CLANG_PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/$CLANG_BIN"
         if [ -f "$CLANG_PATH" ]; then
             echo "✅ NDK clang工具存在: $CLANG_PATH"
         else
-            echo "❌ 未找到NDK clang工具，路径：$CLANG_PATH"
+            echo "❌ 未找到NDK clang工具"
             ls -la $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/ | grep aarch64
             exit 1
         fi
         
-        # 执行构建
+        LOG_LIB_PATH="$NDK_LIB_PATH/liblog.so"
+        if [ -f "$LOG_LIB_PATH" ]; then
+            echo "✅ liblog库存在: $LOG_LIB_PATH"
+        else
+            echo "❌ 未找到liblog库"
+            ls -la $NDK_LIB_PATH/ | grep log
+            exit 1
+        fi
+        
+        # 构建
         cargo ndk -t arm64-v8a -o output build --release
+        
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: hybrid-mount-android-arm64
+        path: output/arm64-v8a/
