@@ -1,114 +1,84 @@
-name: Build Hybrid Mount
+name: Build Android Rust Library
 
 on:
   push:
     branches: [ master ]
   pull_request:
     branches: [ master ]
-  workflow_dispatch: # 允许手动触发
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    
     env:
-      # GitHub Actions Ubuntu镜像默认NDK r29路径（无需修改）
-      ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/29.0.14206865
-      # 编译目标架构（适配安卓arm64）
-      TARGET_ARCH: aarch64-linux-android
-      # 安卓API级别（兼容主流设备）
       ANDROID_API_LEVEL: 29
-
+      TARGET_ARCH: aarch64-linux-android
+    
     steps:
-      - name: 检出代码（含子模块）
-        uses: actions/checkout@v6
-        with:
-          submodules: recursive
-          fetch-depth: 0
+    - uses: actions/checkout@v6
+      with:
+        submodules: recursive
+        fetch-depth: 0
+    
+    - name: Setup NDK
+      uses: nttld/setup-ndk@v1
+      with:
+        ndk-version: r29
+        add-to-path: true
+        link-to-sdk: true
+    
+    - name: Setup Rust toolchain
+      uses: dtolnay/rust-toolchain@nightly
+      with:
+        targets: aarch64-linux-android
+        components: rust-src, clippy, rustfmt
+    
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+    
+    - name: Install build dependencies
+      run: |
+        sudo apt update && sudo apt install -y \
+          gcc-multilib g++-multilib \
+          pkg-config libssl-dev \
+          android-sdk-build-tools
+        cargo install cargo-ndk --locked
+        mkdir -p output target/aarch64-linux-android/release
+        chmod -R 777 .
+    
+    - name: Configure NDK and build
+      run: |
+        # 检测NDK版本，适配clang命名规则
+        NDK_VERSION=$(grep -oP 'r\d+' $ANDROID_NDK_HOME/source.properties | cut -c2-)
+        CLANG_BIN="aarch64-linux-android${ANDROID_API_LEVEL}-clang"
+        EXTRA_LINK_ARG="--target=aarch64-linux-android${ANDROID_API_LEVEL}"
 
-      - name: 安装并配置Android NDK r29
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r29
-          add-to-path: true
-          link-to-sdk: true
+        # 生成.cargo/config.toml（核心配置）
+        mkdir -p .cargo
+        cat > .cargo/config.toml << EOF
+        [target.${TARGET_ARCH}]
+        linker = "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/$CLANG_BIN"
+        ar = "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+        rustflags = [
+            "-C", "link-arg=-fuse-ld=lld",
+            "-C", "target-feature=+crt-static",
+            "-C", "opt-level=3",
+            "-C", "link-arg=$EXTRA_LINK_ARG"
+        ]
 
-      - name: 安装Rust Nightly工具链
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          targets: ${{ env.TARGET_ARCH }}
-          components: rust-src, clippy, rustfmt
+        [build]
+        target = "${TARGET_ARCH}"
+        EOF
 
-      - name: 配置Rust缓存（加速编译）
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: . -> target
-          shared-key: ${{ runner.os }}-rust-${{ hashFiles('**/Cargo.lock') }}
-          add-rust-environment-hash-key: true
-
-      - name: 安装系统依赖
-        run: |
-          sudo apt update && sudo apt install -y \
-            gcc-multilib g++-multilib \
-            pkg-config libssl-dev \
-            android-sdk-build-tools
-          # 安装cargo-ndk工具
-          cargo install cargo-ndk --locked
-          # 创建输出目录并赋予权限
-          mkdir -p output target/${{ env.TARGET_ARCH }}/release
-          chmod -R 777 .
-
-      - name: 生成Rust交叉编译配置（适配NDK r29）
-        run: |
-          # 检测NDK版本，适配clang命名规则
-          NDK_MAJOR=$(echo $ANDROID_NDK_HOME | grep -oE '29\.[0-9]+' | cut -d '.' -f1)
-          if [ "$NDK_MAJOR" -ge 29 ]; then
-              CLANG_BIN="aarch64-linux-android-clang"
-              EXTRA_LINK_ARG="--target=aarch64-linux-android${ANDROID_API_LEVEL}"
-          else
-              CLANG_BIN="aarch64-linux-android${ANDROID_API_LEVEL}-clang"
-              EXTRA_LINK_ARG=""
-          fi
-
-          # 生成.cargo/config.toml（核心配置）
-          mkdir -p .cargo
-          cat > .cargo/config.toml << EOF
-          [target.${TARGET_ARCH}]
-          linker = "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/$CLANG_BIN"
-          ar = "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-          rustflags = [
-              "-C", "link-arg=-fuse-ld=lld",
-              "-C", "target-feature=+crt-static",
-              "-C", "opt-level=3",
-              $([ -n "$EXTRA_LINK_ARG" ] && echo "-C", "link-arg=$EXTRA_LINK_ARG")
-          ]
-
-          [build]
-          target = "${TARGET_ARCH}"
-          EOF
-
-          # 验证clang工具是否存在（关键校验）
-          CLANG_PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/$CLANG_BIN"
-          if [ -f "$CLANG_PATH" ]; then
-              echo "✅ NDK clang工具存在: $CLANG_PATH"
-          else
-              echo "❌ 未找到NDK clang工具，路径：$CLANG_PATH"
-              ls -la $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/ | grep aarch64
-              exit 1
-          fi
-
-      - name: 编译Hybrid Mount
-        run: |
-          # 执行编译（基于xtask的标准编译命令）
-          cargo ndk -t arm64-v8a -o output build --release
-          # 验证编译产物
-          ls -la output/
-          ls -la target/${{ env.TARGET_ARCH }}/release/
-
-      - name: 上传编译产物
-        uses: actions/upload-artifact@v4
-        with:
-          name: hybrid-mount-arm64-v8a
-          path: |
-            output/
-            target/${{ env.TARGET_ARCH }}/release/hybrid_mount
-          retention-days: 7 # 产物保留7天
+        # 验证clang工具是否存在（关键校验）
+        CLANG_PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/$CLANG_BIN"
+        if [ -f "$CLANG_PATH" ]; then
+            echo "✅ NDK clang工具存在: $CLANG_PATH"
+        else
+            echo "❌ 未找到NDK clang工具，路径：$CLANG_PATH"
+            ls -la $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/ | grep aarch64
+            exit 1
+        fi
+        
+        # 执行构建
+        cargo ndk -t arm64-v8a -o output build --release
